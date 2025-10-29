@@ -104,6 +104,56 @@ See `requirements.txt` for the complete list. Key dependencies:
 - `numpy`: Audio processing
 - `uvicorn`: ASGI server
 
+## Streaming Audio from Another Server
+
+To stream audio packets from another server for live transcription:
+
+### Quick Test
+```bash
+# 1. Start your Whisper server
+./bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000
+
+# 2. Test the connection
+./bin/python simple_test.py
+```
+
+### Integration Examples
+
+See `audio_forwarder.py` for complete examples of:
+- Streaming from microphone
+- Streaming from audio files  
+- Forwarding from another audio server
+- Handling different audio formats
+
+### Key Points for Your Audio Server Integration:
+
+1. **Connect to WebSocket**: `ws://localhost:8000/ws`
+2. **Send binary audio data** (not JSON)
+3. **Audio format**: 16kHz, 16-bit, mono, 20ms frames (640 bytes each)
+4. **Receive JSON responses**:
+   ```json
+   {"type": "interim", "text": "partial transcription..."}
+   {"type": "final", "text": "complete transcription"}
+   ```
+
+### Python Example:
+```python
+import asyncio
+import websockets
+
+async def stream_to_whisper():
+    async with websockets.connect("ws://localhost:8000/ws") as ws:
+        # Send 640-byte audio frames
+        await ws.send(audio_frame_bytes)
+        
+        # Listen for transcription
+        response = await ws.recv()
+        result = json.loads(response)
+        print(f"Transcription: {result['text']}")
+```
+
+For complete examples, see `STREAMING_EXAMPLES.md`.
+
 ## Notes
 
 - The first run will download the Whisper model (may take a few minutes)
