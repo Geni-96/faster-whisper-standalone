@@ -1,5 +1,5 @@
 # app.py
-import asyncio, json, struct, time, io
+import asyncio, json, struct, time, io, os
 from collections import deque
 from typing import Deque, Tuple
 
@@ -16,7 +16,15 @@ CHANNELS = 1
 # ----- Model -----
 # Choose your model: "small.en", "base", "small", "medium", "large-v3", etc.
 # device="cuda" with compute_type="int8_float16" (good balance) if GPU; else CPU defaults.
-model = WhisperModel("small.en", device="auto", compute_type="int8")
+# Tune CPU threads for better throughput on macOS/CPU-only.
+CPU_THREADS = max(1, min(6, (os.cpu_count() or 4)))
+model = WhisperModel(
+    "small.en",
+    device="auto",
+    compute_type="int8",  # fastest on CPU; try "int8_float16" on GPU
+    cpu_threads=CPU_THREADS,
+    num_workers=1,  # keep 1 to avoid competing decoders on CPU
+)
 
 # ----- App -----
 app = FastAPI()
@@ -28,9 +36,15 @@ SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000
 # VAD: 0 = very aggressive (more filtering), 3 = least aggressive
 vad = webrtcvad.Vad(2)
 
-# Rolling audio buffer ~ 8 seconds
-ROLLING_SECONDS = 8
+# Rolling audio buffer ~ 6 seconds (smaller buffer reduces re-decode cost)
+ROLLING_SECONDS = 6
 ROLLING_SAMPLES = SAMPLE_RATE * ROLLING_SECONDS
+
+# End-of-speech detection and interim cadence
+EMIT_EVERY = 0.5  # seconds between interim updates
+SILENCE_FOR_FINAL_MS = 400  # how long of silence to consider utterance ended
+SILENCE_FRAMES_FOR_FINAL = max(1, SILENCE_FOR_FINAL_MS // FRAME_MS)
+MIN_UTTERANCE_SECONDS = 1.2  # don't finalize super short blips
 
 def bytes_to_int16(buf: bytes) -> np.ndarray:
     # little-endian int16
@@ -56,10 +70,52 @@ async def stream_transcribe(ws: WebSocket):
     await ws.accept()
     audio_q: Deque[np.ndarray] = deque(maxlen=ROLLING_SAMPLES)
 
+    # Per-utterance buffer and VAD state
+    utter_q: Deque[int] = deque(maxlen=SAMPLE_RATE * 30)  # up to 30s per utterance
+    in_speech = False
+    silence_frames = 0
+
     # simple debouncing for interim emissions
     last_emit = 0.0
-    EMIT_EVERY = 0.7  # seconds
-    last_final_text = ""
+
+    # Only one inference at a time to avoid contention/backoff
+    infer_lock = asyncio.Lock()
+
+    async def run_transcribe(buf_i16: np.ndarray, fast: bool) -> str:
+        audio_f32 = int16_to_float32(buf_i16)
+        # Faster settings: greedy decode, no timestamps, no VAD filter (we already filter)
+        kwargs = dict(
+            language="en",
+            vad_filter=False,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+            temperature=0.0,
+        )
+        if fast:
+            kwargs.update(dict(beam_size=1, best_of=1, no_speech_threshold=0.6, log_prob_threshold=-1.0))
+        else:
+            kwargs.update(dict(beam_size=1, best_of=1))
+
+        segments, _ = await asyncio.to_thread(model.transcribe, audio_f32, **kwargs)
+        return "".join(seg.text for seg in segments).strip()
+
+    async def do_interim(buf: np.ndarray):
+        async with infer_lock:
+            try:
+                interim_text = await run_transcribe(buf, fast=True)
+                if interim_text:
+                    await ws.send_text(json.dumps({"type": "interim", "text": interim_text}))
+            except Exception as e:
+                await ws.send_text(json.dumps({"type": "error", "error": f"interim: {e}"}))
+
+    async def do_final(buf: np.ndarray):
+        async with infer_lock:
+            try:
+                final_text = await run_transcribe(buf, fast=False)
+                if final_text:
+                    await ws.send_text(json.dumps({"type": "final", "text": final_text}))
+            except Exception as e:
+                await ws.send_text(json.dumps({"type": "error", "error": f"final: {e}"}))
 
     try:
         while True:
@@ -69,62 +125,40 @@ async def stream_transcribe(ws: WebSocket):
                 # Ignore malformed frames
                 continue
 
-            # VAD: drop silence early to save compute
-            if not vad_keep(packet):
-                continue
+            # VAD state per frame
+            is_voice = vad_keep(packet)
 
             chunk_i16 = bytes_to_int16(packet)
             audio_q.extend(chunk_i16.tolist())
 
             now = time.time()
-            # Run interim decode periodically for low latency
-            if now - last_emit >= EMIT_EVERY and len(audio_q) >= SAMPLE_RATE * 1.0:
-                last_emit = now
-                # Take last ~3.0s window for interim
-                win = min(len(audio_q), SAMPLE_RATE * 3)
-                buf = np.array(list(audio_q)[-win:], dtype=np.int16)
 
-                # Convert to float32 range for faster-whisper
-                audio_f32 = int16_to_float32(buf)
+            if is_voice:
+                # Enter/continue speech
+                in_speech = True
+                silence_frames = 0
+                utter_q.extend(chunk_i16.tolist())
 
-                # Quick decode: small beam, no temperature sampling for determinism
-                segments, _ = model.transcribe(
-                    audio_f32,
-                    language="en",
-                    vad_filter=True,
-                    beam_size=3,
-                    best_of=1,
-                    condition_on_previous_text=False,
-                    no_speech_threshold=0.6,
-                    temperature=0.0,
-                    word_timestamps=False,
-                    log_prob_threshold=-1.0,  # be permissive for short windows
-                )
-                interim_text = "".join(seg.text for seg in segments).strip()
-                if interim_text:
-                    await ws.send_text(json.dumps({"type": "interim", "text": interim_text}))
+                # Interim update (skip if an inference is already running)
+                if now - last_emit >= EMIT_EVERY and len(utter_q) >= SAMPLE_RATE * 1.0 and not infer_lock.locked():
+                    last_emit = now
+                    win = min(len(utter_q), SAMPLE_RATE * 2)
+                    buf = np.array(list(utter_q)[-win:], dtype=np.int16)
+                    asyncio.create_task(do_interim(buf))
+            else:
+                if in_speech:
+                    silence_frames += 1
+                    # Finalize after enough silence
+                    if silence_frames >= SILENCE_FRAMES_FOR_FINAL and len(utter_q) >= int(SAMPLE_RATE * MIN_UTTERANCE_SECONDS):
+                        # Snapshot and reset utterance buffer
+                        buf = np.array(list(utter_q), dtype=np.int16)
+                        utter_q.clear()
+                        in_speech = False
+                        silence_frames = 0
 
-            # Occasionally produce a "final" by decoding a longer window and
-            # diffing against last_final_text to avoid repeats.
-            if len(audio_q) >= SAMPLE_RATE * 4.0 and now - last_emit >= EMIT_EVERY:
-                buf = np.array(list(audio_q), dtype=np.int16)
-                audio_f32 = int16_to_float32(buf)
-
-                segments, _ = model.transcribe(
-                    audio_f32,
-                    language="en",
-                    vad_filter=True,
-                    beam_size=5,
-                    best_of=1,
-                    condition_on_previous_text=False,
-                    word_timestamps=False,
-                    temperature=0.0,
-                )
-                full_text = "".join(seg.text for seg in segments).strip()
-                final_text = full_text[len(last_final_text):].strip() if full_text.startswith(last_final_text) else full_text
-                if final_text:
-                    last_final_text = full_text
-                    await ws.send_text(json.dumps({"type": "final", "text": final_text}))
+                        # Run final transcription (will wait if an interim is running)
+                        asyncio.create_task(do_final(buf))
+                # else: still in silence; do nothing
 
     except WebSocketDisconnect:
         pass

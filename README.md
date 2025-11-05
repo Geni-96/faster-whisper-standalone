@@ -89,11 +89,13 @@ Available models: `tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `me
 
 ## Performance Tuning
 
-- **Rolling Buffer**: Currently set to 8 seconds (`ROLLING_SECONDS = 8`)
-- **VAD Aggressiveness**: Set to 2 (0=most aggressive, 3=least aggressive)
-- **Emission Frequency**: Interim results every 0.7 seconds (`EMIT_EVERY = 0.7`)
+- End-of-speech finalization driven by VAD to avoid re-decoding long buffers
+- Rolling buffer size: 6 seconds (`ROLLING_SECONDS = 6`)
+- VAD aggressiveness: 2 (0 = most aggressive, 3 = least)
+- Interim emission cadence: every 0.5s (`EMIT_EVERY = 0.5`)
+- Single-inference lock to prevent overlapping decodes and backoff errors
 
-These can be adjusted in `app.py` based on your latency and accuracy requirements.
+You can adjust these in `app.py` based on your latency and accuracy needs. For even lower latency on CPU-only systems, try a smaller model (e.g., `base.en` or `tiny.en`).
 
 ## Dependencies
 
