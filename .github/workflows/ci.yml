@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r whisper-standalone/requirements.txt
+          # Ensure test libs present if not in requirements
+          pip install pytest
+
+      - name: Run tests
+        env:
+          FWS_SKIP_MODEL_INIT: "1"
+          FWS_SILENCE_FINAL_MS: "60"
+          FWS_SILENCE_GRACE_MS: "0"
+          FWS_PRE_ROLL_FRAMES: "0"
+          FWS_EMIT_EVERY: "0.1"
+          FWS_ENERGY_ENABLE: "1"
+        run: |
+          cd whisper-standalone
+          pytest -q

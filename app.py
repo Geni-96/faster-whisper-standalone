@@ -20,13 +20,31 @@ CHANNELS = 1
 CPU_THREADS = max(1, min(6, (os.cpu_count() or 4)))
 MODEL_NAME = os.getenv("FWS_MODEL", "small.en")
 COMPUTE_TYPE = os.getenv("FWS_COMPUTE_TYPE", "int8")
-model = WhisperModel(
-    MODEL_NAME,
-    device=os.getenv("FWS_DEVICE", "auto"),
-    compute_type=COMPUTE_TYPE,  # fastest on CPU; try "int8_float16" on GPU
-    cpu_threads=CPU_THREADS,
-    num_workers=int(os.getenv("FWS_NUM_WORKERS", "1")),  # keep 1 to avoid competing decoders on CPU
-)
+
+# Allow tests/CI to skip heavy model initialization and inject a fake model
+_SKIP_MODEL = os.getenv("FWS_SKIP_MODEL_INIT", "0") == "1"
+if _SKIP_MODEL:
+    class _FakeSeg:
+        def __init__(self, text: str):
+            self.text = text
+            self.avg_logprob = -0.1
+            self.compression_ratio = 1.0
+            self.no_speech_prob = 0.0
+
+    class _FakeModel:
+        def transcribe(self, audio_f32, **kwargs):  # signature-compatible enough
+            # Always return a short deterministic token so tests can assert
+            return [_FakeSeg("beep ")], {"language": "en"}
+
+    model = _FakeModel()
+else:
+    model = WhisperModel(
+        MODEL_NAME,
+        device=os.getenv("FWS_DEVICE", "auto"),
+        compute_type=COMPUTE_TYPE,  # fastest on CPU; try "int8_float16" on GPU
+        cpu_threads=CPU_THREADS,
+        num_workers=int(os.getenv("FWS_NUM_WORKERS", "1")),  # keep 1 to avoid competing decoders on CPU
+    )
 
 # ----- App -----
 app = FastAPI()
@@ -73,6 +91,9 @@ INTERIM_BEAM_SIZE = int(os.getenv("FWS_INTERIM_BEAM", "1"))
 
 # Previous text conditioning for finals
 COND_PREV_FINAL = os.getenv("FWS_COND_PREV", "0") == "1"
+
+# Speaker labeling (placeholder; diarization not implemented here)
+SPEAKER_LABEL = os.getenv("FWS_SPEAKER", "Speaker 1")
 
 def bytes_to_int16(buf: bytes) -> np.ndarray:
     # little-endian int16
@@ -179,6 +200,10 @@ async def stream_transcribe(ws: WebSocket):
 
     last_interim_sent = ""
     last_final_sent = ""
+    # Timing tracking
+    conn_start_time = time.time()
+    frames_seen = 0  # count of 20ms frames processed
+    current_utter_tstart = None  # seconds since conn start
 
     async def do_interim(buf: np.ndarray):
         nonlocal last_interim_sent
@@ -201,14 +226,19 @@ async def stream_transcribe(ws: WebSocket):
                 if interim_text == last_interim_sent:
                     return
                 last_interim_sent = interim_text
-                await ws.send_text(json.dumps({"type": "interim", "text": interim_text}))
+                # Emit as 'partial' with timing when available
+                now_t = frames_seen * (FRAME_MS / 1000.0)
+                payload = {"type": "partial", "text": interim_text}
+                if current_utter_tstart is not None:
+                    payload.update({"tStart": current_utter_tstart, "tEnd": now_t})
+                await ws.send_text(json.dumps(payload))
             except Exception as e:
                 await ws.send_text(json.dumps({"type": "error", "error": f"interim: {e}"}))
 
     # Tail overlap between utterances to avoid boundary word loss
     TAIL_SAMPLES = int(os.getenv("FWS_TAIL_SAMPLES", str(SAMPLE_RATE // 2)))  # 0.5s
 
-    async def do_final(buf: np.ndarray):
+    async def do_final(buf: np.ndarray, t_start: float, t_end: float):
         nonlocal last_final_sent
         async with infer_lock:
             try:
@@ -230,7 +260,14 @@ async def stream_transcribe(ws: WebSocket):
                     return
                 # Provide final text and model name/meta
                 last_final_sent = final_text
-                await ws.send_text(json.dumps({"type": "final", "text": final_text, "model": MODEL_NAME}))
+                await ws.send_text(json.dumps({
+                    "type": "final",
+                    "text": final_text,
+                    "tStart": t_start,
+                    "tEnd": t_end,
+                    "speaker": SPEAKER_LABEL,
+                    "model": MODEL_NAME
+                }))
             except Exception as e:
                 await ws.send_text(json.dumps({"type": "error", "error": f"final: {e}"}))
 
@@ -247,6 +284,7 @@ async def stream_transcribe(ws: WebSocket):
             # VAD state per frame
             is_voice = vad_keep(packet)
             total_frames += 1
+            frames_seen += 1
 
             chunk_i16 = bytes_to_int16(packet)
             audio_q.extend(chunk_i16.tolist())
@@ -267,6 +305,8 @@ async def stream_transcribe(ws: WebSocket):
                     if pre_roll:
                         utter_q.extend(list(pre_roll))
                     in_speech = True
+                    # mark utterance start time
+                    current_utter_tstart = frames_seen * (FRAME_MS / 1000.0)
                 silence_frames = 0
                 utter_q.extend(chunk_i16.tolist())
                 pre_roll.clear()
@@ -294,7 +334,14 @@ async def stream_transcribe(ws: WebSocket):
                             pre_roll.extend(tail)  # seed next utterance with tail overlap
                             in_speech = False
                             silence_frames = 0
-                            asyncio.create_task(do_final(buf))
+                            # compute utterance end time and emit boundary immediately
+                            t_end = frames_seen * (FRAME_MS / 1000.0)
+                            t_start = current_utter_tstart if current_utter_tstart is not None else max(0.0, t_end - (len(buf)/SAMPLE_RATE))
+                            # boundary event (notify client to finalize current line)
+                            await ws.send_text(json.dumps({"type": "boundary", "event": "utterance_end", "tEnd": t_end}))
+                            # schedule final decode with timing
+                            asyncio.create_task(do_final(buf, t_start, t_end))
+                            current_utter_tstart = None
                         elif silence_frames >= (SILENCE_FRAMES_FOR_FINAL + GRACE_FRAMES):
                             # too short, discard utterance but reset state
                             utter_q.clear()

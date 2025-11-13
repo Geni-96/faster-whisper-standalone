@@ -57,45 +57,89 @@ Connect to: `ws://localhost:8000/ws`
 
 Send raw PCM16 audio data as binary WebSocket messages. Each message should contain exactly 640 bytes (320 samples × 2 bytes per sample).
 
-#### Response Format
+#### Response Message Types
 
-The server sends JSON messages with the following structure:
+The server now emits structured JSON events for finer-grained, low‑latency segmentation:
 
+1. Partial (previously "interim")
 ```json
 {
-  "type": "interim",  // or "final" or "error"
-  "text": "transcribed text"
+  "type": "partial",
+  "text": "partial transcription so far",
+  "tStart": 12.34,          // seconds since connection start (utterance start time)
+  "tEnd": 13.02             // current partial end time (seconds)
+}
+```
+2. Boundary (utterance end detected by VAD + silence grace)
+```json
+{
+  "type": "boundary",
+  "event": "utterance_end",
+  "tEnd": 14.27              // end time of the utterance in seconds
+}
+```
+3. Final (decoded complete utterance after boundary)
+```json
+{
+  "type": "final",
+  "text": "complete utterance text",
+  "tStart": 12.34,
+  "tEnd": 14.27,
+  "speaker": "Speaker 1",  // placeholder label; diarization not yet implemented
+  "model": "small.en"
+}
+```
+4. Error
+```json
+{
+  "type": "error",
+  "error": "description"
 }
 ```
 
-- `interim`: Partial transcription results for low latency
-- `final`: Completed transcription segments
-- `error`: Error messages
+Client handling recommendations:
+- Use `partial` events to update an in‑progress line.
+- On `boundary`, finalize the current line immediately in the UI (even before the `final` arrives).
+- Replace that finalized line with the `final` text when it comes (may include corrections due to context/prompting).
+- Accumulate `final` entries for downloadable transcript.
 
 ## Model Configuration
 
-The current configuration uses:
-- Model: `small.en` (English-only, ~244MB)
-- Device: `auto` (will use GPU if available, otherwise CPU)
-- Compute Type: `int8` for efficiency
+Runtime model and decoding parameters are now environment configurable:
 
-You can modify these settings in `app.py`:
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `FWS_MODEL` | Whisper model name | `small.en` |
+| `FWS_DEVICE` | Device (`auto`, `cpu`, `cuda`) | `auto` |
+| `FWS_COMPUTE_TYPE` | Quantization/precision | `int8` |
+| `FWS_FINAL_BEAM` | Beam size for final decodes | `3` |
+| `FWS_INTERIM_BEAM` | Beam size for partial decodes | `1` |
+| `FWS_VAD_MODE` | WebRTC VAD aggressiveness (0–3) | `1` |
+| `FWS_PRE_ROLL_FRAMES` | Frames prepended at utterance start | `50` (≈1s) |
+| `FWS_TAIL_SAMPLES` | Overlap tail samples (context carryover) | `8000` (0.5s) |
+| `FWS_SILENCE_FINAL_MS` | Base silence threshold for finalization | `450` |
+| `FWS_SILENCE_GRACE_MS` | Extra silence grace after threshold | `200` |
+| `FWS_ALLOW_SHORT_SILENCE_FRAMES` | Allowed brief pauses within speech | `3` |
+| `FWS_EMIT_EVERY` | Partial emission cadence (seconds) | `0.5` |
+| `FWS_MAX_INTERIM_RTF` | Max RTF to still emit partials | `1.1` |
+| `FWS_COND_PREV` | Condition finals on previous text | `0` (disabled) |
+| `FWS_SPEAKER` | Speaker label placeholder | `Speaker 1` |
 
-```python
-model = WhisperModel("small.en", device="auto", compute_type="int8")
+Example:
+```bash
+export FWS_MODEL=base.en
+export FWS_VAD_MODE=2
+export FWS_COND_PREV=1
+uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-Available models: `tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `medium`, `medium.en`, `large-v1`, `large-v2`, `large-v3`
+## Performance & Segmentation
 
-## Performance Tuning
-
-- End-of-speech finalization driven by VAD to avoid re-decoding long buffers
-- Rolling buffer size: 6 seconds (`ROLLING_SECONDS = 6`)
-- VAD aggressiveness: 2 (0 = most aggressive, 3 = least)
-- Interim emission cadence: every 0.5s (`EMIT_EVERY = 0.5`)
-- Single-inference lock to prevent overlapping decodes and backoff errors
-
-You can adjust these in `app.py` based on your latency and accuracy needs. For even lower latency on CPU-only systems, try a smaller model (e.g., `base.en` or `tiny.en`).
+- VAD + silence grace drives quick segmentation and boundary events.
+- Tail overlap (`FWS_TAIL_SAMPLES`) preserves trailing context for next utterance.
+- Pre-roll (`FWS_PRE_ROLL_FRAMES`) ensures leading words aren’t lost.
+- Adaptive partial suppression when real-time factor (RTF) exceeds `FWS_MAX_INTERIM_RTF` keeps accuracy.
+- Optional previous-text conditioning (`FWS_COND_PREV=1`) can improve continuity at utterance boundaries.
 
 ## Dependencies
 
@@ -130,13 +174,9 @@ See `audio_forwarder.py` for complete examples of:
 ### Key Points for Your Audio Server Integration:
 
 1. **Connect to WebSocket**: `ws://localhost:8000/ws`
-2. **Send binary audio data** (not JSON)
-3. **Audio format**: 16kHz, 16-bit, mono, 20ms frames (640 bytes each)
-4. **Receive JSON responses**:
-   ```json
-   {"type": "interim", "text": "partial transcription..."}
-   {"type": "final", "text": "complete transcription"}
-   ```
+2. **Send binary audio frames**: raw PCM16, 640 bytes each (20ms at 16kHz mono)
+3. **Receive JSON events**: `partial`, `boundary`, `final`, `error`
+4. **Finalize logic**: On `boundary`, close current line in UI; replace with `final` on arrival.
 
 ### Python Example:
 ```python
@@ -158,7 +198,52 @@ For complete examples, see `STREAMING_EXAMPLES.md`.
 
 ## Notes
 
-- The first run will download the Whisper model (may take a few minutes)
-- VAD filtering helps reduce unnecessary processing of silence
-- The system maintains a rolling audio buffer for context
-- Transcription happens on voice-active segments only
+- First run downloads the selected model.
+- VAD + grace logic aims to minimize truncated words.
+- Real-time factor (RTF) logging (in server logs) helps diagnose performance limits.
+- Speaker diarization is not yet implemented; `speaker` is a placeholder.
+
+## Testing & CI
+
+Automated tests (helpers, audio forwarding utility, and WebSocket flow) live under `tests/` and are executed in CI via GitHub Actions (workflow: `.github/workflows/ci.yml`).
+
+### Run Tests Locally
+
+Activate your virtualenv, install deps, then run:
+
+```bash
+source bin/activate
+pytest -q
+```
+
+The test suite sets `FWS_SKIP_MODEL_INIT=1` to use a lightweight fake model—this avoids downloading Whisper weights and keeps tests fast. To run against a real model, unset that variable:
+
+```bash
+unset FWS_SKIP_MODEL_INIT
+pytest -k websocket_flow -vv
+```
+
+### CI Environment Variables
+
+In CI we deliberately lower timing thresholds and skip model initialization:
+
+| Var | Purpose |
+|-----|---------|
+| `FWS_SKIP_MODEL_INIT=1` | Replace Whisper with deterministic fake for speed |
+| `FWS_SILENCE_FINAL_MS=60` | Fast utterance finalization (3×20ms frames) |
+| `FWS_MIN_UTTER_SEC=0.3` | Allow short test utterances |
+
+### Adding More Tests
+
+You can extend coverage by adding:
+- Edge cases for malformed audio sequence lengths
+- Stress tests with rapid alternating speech/silence
+- Timing/RTF assertions using the `metrics` payload (enable in fake model if needed)
+
+### Troubleshooting Hanging Tests
+
+If a WebSocket test appears to hang, ensure it either:
+1. Streams >1s of audio (required for a partial emission), or
+2. Sends adequate silence frames after speech to trigger boundary/final events.
+
+Short audio (<1s) plus no silence will produce no server messages, so tests must not block waiting indefinitely.
