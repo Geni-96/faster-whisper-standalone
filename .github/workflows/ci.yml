@@ -22,13 +22,24 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          pip install -r whisper-standalone/requirements.txt
-          # Ensure test libs present if not in requirements
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f whisper-standalone/requirements.txt ]; then
+            pip install -r whisper-standalone/requirements.txt
+          else
+            echo "requirements.txt not found" >&2
+            ls -la
+            exit 1
+          fi
+          # Ensure pytest present
           pip install pytest
 
       - name: Run tests
+        shell: bash
         env:
           FWS_SKIP_MODEL_INIT: "1"
           FWS_SILENCE_FINAL_MS: "60"
@@ -37,5 +48,14 @@ jobs:
           FWS_EMIT_EVERY: "0.1"
           FWS_ENERGY_ENABLE: "1"
         run: |
-          cd whisper-standalone
-          pytest -q
+          set -euxo pipefail
+          if [ -d tests ] || [ -f pytest.ini ]; then
+            pytest -q
+          elif [ -d whisper-standalone ]; then
+            cd whisper-standalone
+            pytest -q
+          else
+            echo "No tests directory found" >&2
+            ls -la
+            exit 1
+          fi

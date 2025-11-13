@@ -44,3 +44,4 @@ webrtcvad==2.0.10
 
 # Testing
 pytest==8.3.3
+websockets==12.0
